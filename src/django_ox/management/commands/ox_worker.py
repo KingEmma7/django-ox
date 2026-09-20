@@ -95,7 +95,7 @@ class Command(DatabaseCommand):
         alias = self.database(options)
         backend_alias = options["backend"]
         if backend_alias not in task_backends:
-            known = ", ".join(sorted(task_backends))
+            known = ", ".join(sorted(task_backends)) or "none"
             raise CommandError(
                 f"No task backend alias {backend_alias!r} in TASKS. "
                 f"Known aliases: {known}."
