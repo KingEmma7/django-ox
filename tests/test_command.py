@@ -1,3 +1,8 @@
+import os
+import subprocess
+import sysconfig
+from pathlib import Path
+
 import pytest
 from django.core.management import CommandError, call_command
 
@@ -36,17 +41,19 @@ def recorded_worker(monkeypatch):
     return WorkerRecorder
 
 
-def test_command_runs_the_configured_worker_class(settings):
+@pytest.mark.parametrize("backend", ["default", "emails"])
+def test_command_runs_the_configured_worker_class(settings, backend):
     settings.TASKS = {
         "default": {
             "BACKEND": "django_ox.backend.OxBackend",
             "OPTIONS": {"WORKER_CLASS": "tests.test_command.StoppedWorker"},
         }
     }
+    settings.TASKS["emails"] = settings.TASKS["default"]
     StoppedWorker.started = False
 
     with pytest.raises(SystemExit) as excinfo:
-        call_command("ox_worker")
+        call_command("ox_worker", backend=backend)
 
     assert excinfo.value.code == 0
     assert StoppedWorker.started is True
@@ -248,3 +255,107 @@ class TestTheRecycleExitCodeIsPinned:
             "the supervisor stopped recognising a recycle, so it reads one "
             "as a crash and spends its restart budget"
         )
+
+
+@pytest.mark.parametrize("processes", [1, 4])
+def test_unknown_backend_is_rejected_before_startup(settings, monkeypatch, processes):
+    settings.TASKS = {
+        alias: {"BACKEND": "django_ox.backend.OxBackend"}
+        for alias in ["zebra", "default", "emails"]
+    }
+
+    def boom(*args, **kwargs):
+        raise AssertionError("worker or supervisor reached")
+
+    monkeypatch.setattr(ox_worker, "worker_class", boom)
+    monkeypatch.setattr(ox_worker, "Supervisor", boom)
+    with pytest.raises(CommandError) as excinfo:
+        call_command("ox_worker", backend="missing", processes=processes, verbosity=0)
+    assert str(excinfo.value) == (
+        "No task backend alias 'missing' in TASKS. "
+        "Known aliases: default, emails, zebra."
+    )
+
+
+def test_backend_uses_framework_defaults(settings, recorded_worker):
+    del settings.TASKS
+    with pytest.raises(SystemExit) as excinfo:
+        call_command("ox_worker", verbosity=0)
+    assert excinfo.value.code == 0
+    (worker,) = recorded_worker.instances
+    assert worker.kwargs["backend_alias"] == "default"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="supervisor requires POSIX signals")
+@pytest.mark.parametrize("backend", ["default", "emails"])
+def test_valid_backend_reaches_supervisor(settings, monkeypatch, backend):
+    settings.TASKS = {
+        alias: {"BACKEND": "django_ox.backend.OxBackend"}
+        for alias in ["default", "emails"]
+    }
+    calls = []
+
+    class SupervisorRecorder:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def handle_signal(self, *args):
+            pass
+
+        def run(self):
+            return 0
+
+    monkeypatch.setattr(ox_worker, "Supervisor", SupervisorRecorder)
+    monkeypatch.setattr(ox_worker.signal, "signal", lambda *args: None)
+    with pytest.raises(SystemExit) as excinfo:
+        call_command("ox_worker", backend=backend, processes=4, verbosity=0)
+    assert excinfo.value.code == 0
+    (call,) = calls
+    assert call["processes"] == 4
+    assert call["worker_args"][:2] == ["--backend", backend]
+
+
+@pytest.mark.parametrize("processes", [1, 4])
+@pytest.mark.parametrize("traceback", [False, True])
+def test_unknown_backend_cli(tmp_path, processes, traceback):
+    (tmp_path / "backend_settings.py").write_text(
+        "SECRET_KEY = 'test-only'\n"
+        "INSTALLED_APPS = ['django_ox']\n"
+        "DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3'}}\n"
+        "TASKS = {alias: {'BACKEND': 'django_ox.backend.OxBackend'} "
+        "for alias in ['zebra', 'default', 'emails']}\n"
+    )
+    command = [
+        str(Path(sysconfig.get_path("scripts")) / "django-admin"),
+        "ox_worker",
+        "--settings=backend_settings",
+        f"--pythonpath={tmp_path}",
+        "--backend=missing",
+        f"--processes={processes}",
+        "--no-color",
+    ]
+    if traceback:
+        command.append("--traceback")
+    result = subprocess.run(  # noqa: S603
+        command,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+        env={
+            key: value
+            for key, value in os.environ.items()
+            if key != "DJANGO_SETTINGS_MODULE"
+        },
+    )
+    message = (
+        "CommandError: No task backend alias 'missing' in TASKS. "
+        "Known aliases: default, emails, zebra.\n"
+    )
+    assert result.returncode == 1
+    assert result.stdout == ""
+    if traceback:
+        assert "Traceback (most recent call last):" in result.stderr
+        assert result.stderr.endswith(message)
+    else:
+        assert result.stderr == message
