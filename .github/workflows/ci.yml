@@ -310,6 +310,11 @@ jobs:
       # Catches a README that would fail to render on the package page.
       - run: twine check --strict dist/*
 
+  # Static analysis of these workflows. It sits under ci-ok because ci-ok is
+  # the only check branch protection requires. The binary is installed rather
+  # than zizmor-action because the action reports through SARIF by default,
+  # which never fails the job. Pinned by version and sha256 like gitleaks in
+  # security.yml; dependabot cannot see the pin, so bump both by hand.
   zizmor:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -331,8 +336,11 @@ jobs:
           install zizmor /usr/local/bin/zizmor
           zizmor --version
       # Plain output retains nonzero exit codes for findings, including info.
+      # The last three flags stop a zizmor.yml, an inline ignore comment or a
+      # .gitignore entry from silencing a finding, so loosening this gate
+      # always means editing this step.
       - name: Audit GitHub Actions
-        run: zizmor --strict-collection .
+        run: zizmor --strict-collection --collect=all --no-config --no-ignores .
 
   # The one context branch protection requires. Requiring a single summary
   # job instead of every matrix leg means the protection rule survives
